@@ -1,8 +1,11 @@
 import { z, OpenAPIHono, createRoute } from "@hono/zod-openapi";
+import { env, getRuntimeKey } from "hono/adapter";
 import { HTTPException } from "hono/http-exception";
-import { Service, FORMAT_CONTENT_TYPE } from "../utils/synthesis";
-import retry, { RetryError } from "../utils/retry";
-import buildSsml from "../utils/buildSsml";
+import { FORMAT_CONTENT_TYPE } from "../lib/tts/synthesis";
+import { Service } from "../lib/tts/synthesis";
+import retry, { RetryError } from "../lib/utils/retry";
+import buildSsml from "../lib/tts/buildSsml";
+import logger from "../lib/utils/logger";
 type Bindings = {
   TOKEN: string;
 };
@@ -65,35 +68,30 @@ synthesis.openapi(route, async (c) => {
     token,
   } = c.req.valid("query");
 
-  function getToken() {
-    if (
-      typeof globalThis.process !== "undefined" &&
-      globalThis.process.env.TOKEN !== undefined
-    ) {
-      return globalThis.process.env.TOKEN;
-    }
-    if (c.env.TOKEN !== undefined && c.env.TOKEN !== "") {
-      return c.env.TOKEN;
-    }
-    return "";
-  }
+  const systemToken = env(c).TOKEN;
 
-  const systemToken = getToken();
-
-  if (systemToken !== "") {
+  if (systemToken !== "" && systemToken !== undefined) {
     if (token !== systemToken) {
       c.status(401);
       return c.text("Unauthorized");
     }
   }
 
-  const service = new Service();
-
   if (!FORMAT_CONTENT_TYPE.has(format)) {
     throw new HTTPException(400, { message: `无效的音频格式：${format}` });
   }
   const ssml = buildSsml(text, { voiceName, pitch, rate, volume });
-  DEBUG && console.debug("SSML:", ssml);
+
+  // getting service instance, cloudflare workerd has limitation that each request
+  // should not share IO objects, so we need to create a new instance for each request
+  let service: Service;
+  if (getRuntimeKey() === "node") {
+    service = await import("../lib/tts/instance").then((m) => m.service);
+  } else {
+    // workerd
+    service = new Service();
+  }
+
   try {
     const result = await retry(
       async () => {
@@ -102,7 +100,7 @@ synthesis.openapi(route, async (c) => {
       },
       3,
       (index, error, abort) => {
-        console.warn(`Attempt ${index} failed：${error}`);
+        logger.error({ error }, `Attempt ${index} failed`);
         if (
           error instanceof Error &&
           error.message.includes("SSML is invalid")
@@ -113,7 +111,7 @@ synthesis.openapi(route, async (c) => {
       },
     );
     c.header("Content-Type", FORMAT_CONTENT_TYPE.get(format));
-    return c.body(result);
+    return c.body(result.buffer as ArrayBuffer);
   } catch (error) {
     if (error instanceof HTTPException) throw error;
     c.status(500);

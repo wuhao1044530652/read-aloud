@@ -10,3 +10,7 @@ dist-prebuild
 dist-worker
 
 .wrangler
+.vercel
+.env*.local
+
+worker-configuration.d.ts
